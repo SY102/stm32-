@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
 #include "spi.h"
 #include "usart.h"
 #include "gpio.h"
@@ -28,6 +29,7 @@
 #include "NRF24_conf.h"
 #include "stdio.h"
 #include "string.h"
+#include "NRF24_reg_addresses.h"
 
 /* USER CODE END Includes */
 
@@ -60,23 +62,53 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint8_t rx_address[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};    //송신기와 똑같은 주소
+uint8_t tx_address[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
 
-void nrf24_receiver_setup(void)
+extern ADC_HandleTypeDef hadc1;
+extern SPI_HandleTypeDef hspi1;
+extern UART_HandleTypeDef huart2;
+
+
+void nrf24_transmitter_setup(void)
 {
-    nrf24_defaults();
-    HAL_Delay(5);
-    nrf24_stop_listen();
+    nrf24_defaults();                //레지스터 기본값으로 초기화
+    nrf24_pwr_up();
+    nrf24_flush_tx();
+    nrf24_flush_rx();
+    nrf24_clear_rx_dr();
+    nrf24_clear_tx_ds();
+    nrf24_clear_max_rt();
+    nrf24_stop_listen();             //수신모드 비활성화 하여 송신 전용 모드로 전환
 
-    nrf24_set_channel(40);              //무선 채널 40으로 설정
-    nrf24_auto_ack_all(disable);
-    nrf24_set_payload_size(32);         //수신할 데이터 크기 32바이트로 고정
-    nrf24_rx_mode();
-    nrf24_open_rx_pipe(0, rx_address);  //파이프 0에 수신주소 연결
-    nrf24_pwr_up();                     //power up상태로 전환(활성화)
+    nrf24_set_channel(40);           //무선 채널 40번으로 설정
+    nrf24_auto_ack_all(disable);     //자동 ack기능 off=>단순 송신만 수행
+    nrf24_set_payload_size(32);      //한번에 전송할 페이로드 크기 최대 32바이트
+    nrf24_tx_pwr(3);
+    nrf24_data_rate(_1mbps);
+    nrf24_open_tx_pipe(tx_address);  //파이프 0에 tx_address를 열어 송신 대상 지정
+    nrf24_pwr_up();                  //모듈 power up=>송신 준비 완료
 
-    HAL_Delay(2);
-    nrf24_listen();                     //실제 수신 대기 시작
+    nrf24_dpl(enable);
+      nrf24_set_rx_dpl(0, enable);
+}
+
+void debug_dump_settings(void) {
+    uint8_t ch     = nrf24_r_reg(RF_CH, 1);
+    uint8_t pw     = nrf24_r_reg(RX_PW_P0, 1);
+    uint8_t addr[5];
+
+    csn_low();
+    uint8_t cmd = R_REGISTER | RX_ADDR_P0;
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 100);
+    HAL_SPI_Receive(&hspi1, addr, 5, 100);
+    csn_high();
+
+    printf("=== DEBUG SETTINGS ===\r\n");
+    printf(" RF_CH       = %u\r\n", ch);
+    printf(" RX_PW_P0    = %u bytes\r\n", pw);
+    printf(" RX_ADDR_P0  = %02X %02X %02X %02X %02X\r\n",
+           addr[0], addr[1], addr[2], addr[3], addr[4]);
+    printf("======================\r\n");
 }
 
 
@@ -88,30 +120,24 @@ int __io_putchar(int ch)
 }
 
 
-void receive_data(void)
-{
-	uint8_t rx_data[12] = {0};                       //수신 버퍼 0으로 초기화(최대 12바이트)
-
-	    if (nrf24_data_available())                  //통신 모듈에 수신된 데이터가 있는지 확인
-	    {
-	        nrf24_receive(rx_data, sizeof(rx_data));
-	       rx_data[11] = '\0';                       //문자열 끝 표시위해 널 종료 보장
-
-	        printf("Received: %s\r\n", rx_data);     //수신된 데이터 있다면 출력후 8번 led on
-
-	        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
-	                HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
-
-    }
-    else                                              //수신된 데이터 없으면 6번 led on
-    {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-    }
-
-    HAL_Delay(100);
+void transmit_text(const char* msg) {
+    nrf24_transmit((uint8_t*)msg, strlen(msg));
 }
 
+
+static uint32_t ReadADC_Channel(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};              //채널 구성 구조체 초기화
+    sConfig.Channel      = channel;                    //변환할 채널 지정
+    sConfig.Rank         = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5; //샘플링 타임 설정
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);                             //변환 시작
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);  //변환 완료 대기
+    uint32_t value = HAL_ADC_GetValue(&hadc1);         //변환 결과 읽기
+    HAL_ADC_Stop(&hadc1);
+    return value;
+}
 
 /* USER CODE END 0 */
 
@@ -144,13 +170,19 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART2_UART_Init();
   MX_SPI1_Init();
-  /* USER CODE BEGIN 2 */
   MX_USART2_UART_Init();
+  MX_ADC1_Init();
+  /* USER CODE BEGIN 2 */
 
-     nrf24_receiver_setup();
 
+  nrf24_init();
+
+ // char buf[64];
+  nrf24_transmitter_setup();
+ // debug_dump_settings();
+ //nrf24_dpl(enable);                  // ← 여기에 추가
+ //nrf24_set_rx_dpl(0, enable);
 
   /* USER CODE END 2 */
 
@@ -162,10 +194,24 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  receive_data();      //수신 처리함수 호출해 데이터확인,led처리
-	  HAL_Delay(100);
-  }
 
+	        uint32_t x = ReadADC_Channel(ADC_CHANNEL_10);
+	        uint32_t y = ReadADC_Channel(ADC_CHANNEL_11);
+	        uint32_t z = ReadADC_Channel(ADC_CHANNEL_12);  //X,Y,Z축 ADC값 읽기
+
+	        char payload[32];
+	        size_t len = snprintf(payload, sizeof(payload),
+	                                  "X:%4lu Y:%4lu Z:%4lu",
+	                                   x, y, z);
+	        // 3.3) nRF24L01로 전송 (문자열 길이만큼)
+	     	                nrf24_transmit((uint8_t*)payload, len);
+	        //TeraTerm 확인용
+	        HAL_UART_Transmit(&huart2, (uint8_t*)payload, len, HAL_MAX_DELAY);
+	        HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+
+
+	        HAL_Delay(50);
+  }
   /* USER CODE END 3 */
 }
 
@@ -177,6 +223,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -202,6 +249,12 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
   }
